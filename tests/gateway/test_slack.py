@@ -241,6 +241,88 @@ def adapter():
     return a
 
 
+class TestSlackSocketBurstRecovery:
+    @pytest.mark.asyncio
+    async def test_socket_event_runs_in_a_tracked_task(self, adapter):
+        release = asyncio.Event()
+        adapter._schedule_socket_event(release.wait())
+        await asyncio.sleep(0)
+        assert len(adapter._slack_event_tasks) == 1
+        release.set()
+        await asyncio.gather(*adapter._slack_event_tasks)
+        await asyncio.sleep(0)
+        assert not adapter._slack_event_tasks
+
+    @pytest.mark.asyncio
+    async def test_reconciliation_covers_delayed_message_bursts(self, adapter):
+        client = AsyncMock()
+        client.conversations_history.return_value = {"messages": [{
+            "ts": "123.456", "text": "recover", "user": "U1", "client_msg_id": "C1"
+        }]}
+        adapter._get_client = MagicMock(return_value=client)
+        adapter._dedup.is_duplicate("T_TEST:123.456")
+        now = time.time()
+
+        with patch("plugins.platforms.slack.adapter.asyncio.sleep", new=AsyncMock()):
+            adapter._schedule_recent_message_reconciliation("D_TEST", "T_TEST")
+            await asyncio.gather(*adapter._slack_event_tasks)
+
+        kwargs = client.conversations_history.await_args.kwargs
+        assert kwargs["channel"] == "D_TEST"
+        assert kwargs["limit"] == 100
+        assert now - 301 < float(kwargs["oldest"]) <= time.time()
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_reconciliation_covers_thread_replies(self, adapter):
+        client = AsyncMock()
+        client.conversations_history.return_value = {"messages": [{
+            "ts": "123.456", "text": "parent", "user": "U1", "reply_count": 1
+        }]}
+        client.conversations_replies.return_value = {"messages": [
+            {"ts": "123.456", "text": "parent", "user": "U1"},
+            {"ts": "123.789", "text": "reply", "user": "U1", "thread_ts": "123.456"},
+        ]}
+        adapter._get_client = MagicMock(return_value=client)
+
+        with patch("plugins.platforms.slack.adapter.asyncio.sleep", new=AsyncMock()):
+            adapter._schedule_recent_message_reconciliation("D_TEST", "T_TEST")
+            await asyncio.gather(*adapter._slack_event_tasks)
+
+        assert any(
+            call.kwargs.get("channel") == "D_TEST"
+            and call.kwargs.get("ts") == "123.456"
+            and call.kwargs.get("limit") == 100
+            and "oldest" in call.kwargs
+            for call in client.conversations_replies.await_args_list
+        )
+        assert adapter.handle_message.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_reconciliation_uses_thread_ts_directly(self, adapter):
+        client = AsyncMock()
+        client.conversations_replies.return_value = {"messages": [
+            {"ts": "123.456", "text": "parent", "user": "U1"},
+            {"ts": "123.789", "text": "reply", "user": "U1", "thread_ts": "123.456"},
+        ]}
+        adapter._get_client = MagicMock(return_value=client)
+
+        with patch("plugins.platforms.slack.adapter.asyncio.sleep", new=AsyncMock()):
+            adapter._schedule_recent_message_reconciliation(
+                "D_TEST", "T_TEST", "123.456"
+            )
+            await asyncio.gather(*adapter._slack_event_tasks)
+
+        client.conversations_history.assert_not_awaited()
+        assert any(
+            call.kwargs.get("channel") == "D_TEST"
+            and call.kwargs.get("ts") == "123.456"
+            and call.kwargs.get("limit") == 100
+            and "oldest" in call.kwargs
+            for call in client.conversations_replies.await_args_list
+        )
+
+
 @pytest.fixture(autouse=True)
 def _redirect_cache(tmp_path, monkeypatch):
     """Point document cache to tmp_path so tests don't touch ~/.hermes."""

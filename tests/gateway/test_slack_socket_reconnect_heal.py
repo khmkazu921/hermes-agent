@@ -379,3 +379,35 @@ class TestSocketModeRestart:
         await adapter._socket_watchdog_loop()
 
         assert reasons == ["transport disconnected"]
+
+    @pytest.mark.asyncio
+    async def test_watchdog_reconciles_known_dms(self, adapter):
+        live_task = MagicMock()
+        live_task.done.return_value = False
+        adapter._socket_mode_task = live_task
+        adapter._channel_team = {}
+        client = AsyncMock()
+        client.conversations_list.return_value = {
+            "channels": [
+                {"id": "D_TEST", "user": "U_TEST", "is_user_deleted": False},
+                {"id": "D_CLOSED", "user": "U_CLOSED", "is_user_deleted": True},
+            ]
+        }
+        adapter._team_clients = {"T_TEST": client}
+        scheduled = []
+        adapter._schedule_recent_message_reconciliation = (
+            lambda channel, team: scheduled.append((channel, team))
+        )
+
+        async def _connected():
+            adapter._running = False
+            return True
+
+        adapter._socket_transport_connected = _connected
+        adapter._socket_ping_pong_stale = MagicMock(return_value=False)
+        adapter._socket_watchdog_interval_s = 0
+
+        await adapter._socket_watchdog_loop()
+
+        client.conversations_list.assert_awaited_once_with(types="im", limit=100)
+        assert scheduled == [("D_TEST", "T_TEST")]

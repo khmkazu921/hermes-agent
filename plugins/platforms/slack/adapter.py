@@ -77,6 +77,10 @@ except Exception:
 _HERMES_SLACK_USER_AGENT_PREFIX = f"HermesAgent/{_HERMES_VERSION}"
 
 _SLACK_ERROR_BODY_LIMIT_BYTES = 8 * 1024
+_SLACK_RECONCILIATION_LOOKBACK_S = 300
+_SLACK_RECONCILIATION_HISTORY_LIMIT = 100
+_SLACK_RECONNECT_BASE_DELAY_S = 2.0
+_SLACK_RECONNECT_MAX_DELAY_S = 30.0
 
 
 async def _read_error_text_limited(
@@ -913,6 +917,9 @@ class SlackAdapter(BasePlatformAdapter):
         # user messages without bot_id/subtype=bot_message markers.
         self._user_is_bot_cache: Dict[Tuple[str, str], bool] = {}
         self._socket_mode_task: Optional[asyncio.Task] = None
+        # Keep Bolt listeners short so Socket Mode ACKs are not delayed.
+        self._slack_event_tasks: set[asyncio.Task] = set()
+        self._slack_reconciliation_channels: set[Tuple[str, str, str]] = set()
         # Multi-workspace support
         self._team_clients: Dict[str, Any] = {}  # team_id → WebClient
         self._team_bot_user_ids: Dict[str, str] = {}  # team_id → bot_user_id
@@ -1023,6 +1030,7 @@ class SlackAdapter(BasePlatformAdapter):
         self._proxy_url: Optional[str] = None
         self._socket_watchdog_task: Optional[asyncio.Task] = None
         self._socket_reconnect_lock = asyncio.Lock()
+        self._socket_reconnect_attempt = 0
         self._socket_watchdog_interval_s = 15.0
         # Monotonic timestamp of the most recent Socket Mode handler (re)start,
         # used to grant a grace window for the first ping/pong after connect.
@@ -1169,6 +1177,112 @@ class SlackAdapter(BasePlatformAdapter):
         self._trim_oldest_dict_entries(self._channel_team, self._CHANNEL_TEAM_MAX)
         self._trim_oldest_dict_entries(self._channel_teams, self._CHANNEL_TEAM_MAX)
 
+    def _schedule_socket_event(self, coro: Any) -> None:
+        task = asyncio.create_task(coro)
+        self._slack_event_tasks.add(task)
+        task.add_done_callback(self._slack_event_tasks.discard)
+
+    def _schedule_recent_message_reconciliation(
+        self, channel_id: str, team_id: str, thread_ts: str = ""
+    ) -> None:
+        """Recover Socket Mode events omitted during a short message burst."""
+        key = (team_id, channel_id, thread_ts)
+        if not channel_id or key in self._slack_reconciliation_channels:
+            return
+        self._slack_reconciliation_channels.add(key)
+
+        async def _run() -> None:
+            try:
+                await asyncio.sleep(10)
+                client = self._get_client(channel_id, team_id=team_id)
+                if thread_ts:
+                    result = await client.conversations_replies(
+                        channel=channel_id,
+                        ts=thread_ts,
+                        limit=_SLACK_RECONCILIATION_HISTORY_LIMIT,
+                        oldest=str(time.time() - _SLACK_RECONCILIATION_LOOKBACK_S),
+                    )
+                    for reply in result.get("messages", [])[1:]:
+                        reply_ts = str(reply.get("ts") or "")
+                        if not reply_ts:
+                            continue
+                        if reply_ts not in self._processed_message_ts:
+                            self._dedup.discard(
+                                self._workspace_event_id(team_id, reply_ts)
+                            )
+                        await self._handle_slack_message(
+                            {
+                                **reply,
+                                "channel": channel_id,
+                                "team": team_id,
+                                "channel_type": "im"
+                                if channel_id.startswith("D")
+                                else "channel",
+                                "_hermes_reconciled": True,
+                            },
+                            {"team_id": team_id},
+                        )
+                    return
+                result = await client.conversations_history(
+                    channel=channel_id,
+                    limit=_SLACK_RECONCILIATION_HISTORY_LIMIT,
+                    oldest=str(time.time() - _SLACK_RECONCILIATION_LOOKBACK_S),
+                )
+                messages = list(reversed(result.get("messages", [])))
+                for message in messages:
+                    ts = str(message.get("ts") or "")
+                    if ts and ts not in self._processed_message_ts:
+                        self._dedup.discard(self._workspace_event_id(team_id, ts))
+                    replay = {
+                        **message,
+                        "channel": channel_id,
+                        "team": team_id,
+                        "channel_type": "im" if channel_id.startswith("D") else "channel",
+                        "_hermes_reconciled": True,
+                    }
+                    await self._handle_slack_message(replay, {"team_id": team_id})
+
+                    if not message.get("reply_count") or not ts:
+                        continue
+                    replies = await client.conversations_replies(
+                        channel=channel_id,
+                        ts=ts,
+                        limit=_SLACK_RECONCILIATION_HISTORY_LIMIT,
+                        oldest=str(time.time() - _SLACK_RECONCILIATION_LOOKBACK_S),
+                    )
+                    for reply in replies.get("messages", [])[1:]:
+                        reply_ts = str(reply.get("ts") or "")
+                        if not reply_ts:
+                            continue
+                        if reply_ts not in self._processed_message_ts:
+                            self._dedup.discard(
+                                self._workspace_event_id(team_id, reply_ts)
+                            )
+                        await self._handle_slack_message(
+                            {
+                                **reply,
+                                "channel": channel_id,
+                                "team": team_id,
+                                "channel_type": "im"
+                                if channel_id.startswith("D")
+                                else "channel",
+                                "_hermes_reconciled": True,
+                            },
+                            {"team_id": team_id},
+                        )
+            except Exception as exc:
+                response = getattr(exc, "response", None)
+                if isinstance(response, dict) and response.get("error") == "channel_not_found":
+                    self._channel_team.pop(channel_id, None)
+                    channel_teams = getattr(self, "_channel_teams", None)
+                    if channel_teams is not None:
+                        channel_teams.pop(channel_id, None)
+                logger.warning("[Slack] Recent-message reconciliation failed", exc_info=True)
+            finally:
+                self._slack_reconciliation_channels.discard(key)
+
+        self._schedule_socket_event(_run())
+
     def _start_socket_mode_handler(self) -> None:
         """Start the Slack Socket Mode background task."""
         if not self._app or not self._app_token:
@@ -1282,11 +1396,26 @@ class SlackAdapter(BasePlatformAdapter):
             if not self._running or not self._app or not self._app_token:
                 return
 
+            delay = min(
+                _SLACK_RECONNECT_BASE_DELAY_S
+                * (2**self._socket_reconnect_attempt),
+                _SLACK_RECONNECT_MAX_DELAY_S,
+            )
+            if self._socket_reconnect_attempt:
+                logger.info(
+                    "[Slack] Waiting %.1fs before Socket Mode reconnect (attempt %d)",
+                    delay,
+                    self._socket_reconnect_attempt + 1,
+                )
+                await asyncio.sleep(delay)
+                if not self._running:
+                    return
             logger.warning("[Slack] Socket Mode unhealthy (%s); reconnecting", reason)
             await self._stop_socket_mode_handler()
 
             try:
                 self._start_socket_mode_handler()
+                self._socket_reconnect_attempt += 1
             except Exception as exc:  # pragma: no cover - defensive logging
                 logger.error(
                     "[Slack] Socket Mode reconnect failed: %s", exc, exc_info=True
@@ -1322,6 +1451,17 @@ class SlackAdapter(BasePlatformAdapter):
                     # but the client keeps retrying; ping/pong staleness catches
                     # that wedged-zombie case that the bool check above misses.
                     await self._restart_socket_mode("ping/pong stale")
+                elif connected is True:
+                    self._socket_reconnect_attempt = 0
+                if not any(channel.startswith("D") for channel in self._channel_team):
+                    for team_id, client in self._team_clients.items():
+                        result = await client.conversations_list(types="im", limit=100)
+                        for channel in result.get("channels", []):
+                            if not channel.get("is_user_deleted") and channel.get("user") != "USLACKBOT":
+                                self._remember_channel_team(str(channel.get("id") or ""), team_id)
+                for channel_id, team_id in list(self._channel_team.items()):
+                    if channel_id.startswith("D"):
+                        self._schedule_recent_message_reconciliation(channel_id, team_id)
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover - defensive logging
@@ -1940,7 +2080,7 @@ class SlackAdapter(BasePlatformAdapter):
             # Register message event handler
             @self._app.event("message")
             async def handle_message_event(event, say, body):
-                await self._handle_slack_message(event, body)
+                self._schedule_socket_event(self._handle_slack_message(event, body))
 
             # Handle app_mention explicitly. In some Slack app configurations,
             # channel mentions arrive only as app_mention events rather than the
@@ -1951,7 +2091,7 @@ class SlackAdapter(BasePlatformAdapter):
             # _handle_slack_message (MessageDeduplicator) suppresses the second.
             @self._app.event("app_mention")
             async def handle_app_mention(event, say, body):
-                await self._handle_slack_message(event, body)
+                self._schedule_socket_event(self._handle_slack_message(event, body))
 
             @self._app.event("app_home_opened")
             async def handle_app_home_opened(event, say, body):
@@ -2264,6 +2404,9 @@ class SlackAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Disconnect from Slack."""
         self._running = False
+        await _cancel_socket_tasks(self._slack_event_tasks)
+        self._slack_event_tasks.clear()
+        self._slack_reconciliation_channels.clear()
 
         watchdog_task = self._socket_watchdog_task
         self._socket_watchdog_task = None
@@ -5490,6 +5633,13 @@ class SlackAdapter(BasePlatformAdapter):
         # Track which workspace owns this channel
         if team_id and channel_id:
             self._remember_channel_team(channel_id, team_id)
+
+        if not event.get("_hermes_reconciled"):
+            self._schedule_recent_message_reconciliation(
+                channel_id,
+                str(team_id or ""),
+                str(event.get("thread_ts") or ""),
+            )
 
         # Determine if this is a DM or channel message
         channel_type = event.get("channel_type", "")
